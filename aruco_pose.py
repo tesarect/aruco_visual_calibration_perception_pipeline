@@ -21,6 +21,8 @@ from ultralytics import YOLO
 
 MARKER_LENGTH_M = 0.045  # 45mm ArUco marker, per project spec
 ARUCO_MARKER_CLASS_ID = 0  # matches dataset/data.yaml: 0=aruco_marker
+CUP_HOLDER_CLASS_ID = 1  # matches dataset/data.yaml: 1=cup_holder
+HOLE_CLASS_ID = 2  # matches dataset/data.yaml: 2=hole
 
 # Real D415 intrinsics, captured live via:
 #   ros2 topic echo /D415/color/camera_info --once --full-length
@@ -232,6 +234,54 @@ def get_marker_crop(yolo_model, image, conf=0.25, margin_frac=0.2):
         return None
     crop, offset = crop_with_margin(image, marker_boxes[0], margin_frac)
     return crop, offset
+
+
+def detect_centroids(yolo_model_path_or_model, image, class_id, conf=0.25):
+    """Detect all instances of a circular class (cup_holder or hole) and
+    return each one's 2D pixel centroid — no crop, no classical CV step.
+
+    WHY bbox-centroid alone is enough here (unlike the marker): for a
+    straight-on circular object, a TIGHT axis-aligned bounding box's center
+    is mathematically identical to the circle's true center — no HoughCircles
+    or ellipse-fitting needed. This only holds if (a) the box is genuinely
+    tight (not loose/padded) and (b) the camera views the circle roughly
+    head-on (an angled view projects an ellipse, where bbox-centroid is a
+    biased estimate) — both hold for this project's current camera framing,
+    confirmed empirically against the trained model's ~0.995 mAP boxes; if
+    that ever changes (e.g. a much more oblique viewing angle), revisit with
+    real ellipse-fitting instead of assuming this still holds.
+
+    Returns a list of dicts: [{"cx": float, "cy": float, "bbox": [x1,y1,x2,y2],
+    "confidence": float}, ...], pixel coordinates, one entry per detected
+    instance of `class_id` (0 or more — a hole/cup_holder may not always be
+    visible in every frame). This is 2D-only: no 3D pose here, since these
+    classes don't have a solvePnP-style known-geometry marker to solve
+    against (unlike the ArUco marker) — see aruco_pose's module docstring /
+    README for how a caller could add a depth lookup on top if 3D is needed.
+
+    `yolo_model_path_or_model` accepts either a path (loads a fresh model)
+    or an already-loaded ultralytics.YOLO instance, so callers processing
+    many images/classes can load the model once and reuse it.
+    """
+    model = (
+        yolo_model_path_or_model
+        if isinstance(yolo_model_path_or_model, YOLO)
+        else YOLO(yolo_model_path_or_model)
+    )
+    results = model.predict(source=image, conf=conf, verbose=False)[0]
+
+    centroids = []
+    for box in results.boxes:
+        if int(box.cls[0]) != class_id:
+            continue
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        centroids.append({
+            "cx": (x1 + x2) / 2.0,
+            "cy": (y1 + y2) / 2.0,
+            "bbox": [x1, y1, x2, y2],
+            "confidence": float(box.conf[0]),
+        })
+    return centroids
 
 
 # ---------------------------------------------------------------------------

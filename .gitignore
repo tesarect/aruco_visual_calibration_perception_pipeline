@@ -6,8 +6,23 @@ __pycache__/
 # Pretrained checkpoint — re-downloaded by install_local.sh
 yolo11n.pt
 
-# Training outputs (best.pt/last.pt + logs/plots) — regenerate via train.py
-runs/
+# Training outputs (best.pt/last.pt + logs/plots) — regenerate via train.py.
+# EXCEPTION: aruco_cupholder-8's best.pt IS committed (see rules below) —
+# this is the current production model, needed on the rosject for detect-only
+# use where nothing gets (re)trained. Every other run (older runs, last.pt,
+# plots/logs) stays ignored/disposable. Note: "runs/*" (not "runs/") below —
+# an ignored directory can't be un-ignored by later "!" rules, only its
+# CONTENTS can, so every level must be excluded via the trailing "/*" form.
+runs/*
+!runs/detect/
+runs/detect/*
+!runs/detect/runs/
+runs/detect/runs/*
+!runs/detect/runs/aruco_cupholder-8/
+runs/detect/runs/aruco_cupholder-8/*
+!runs/detect/runs/aruco_cupholder-8/weights/
+runs/detect/runs/aruco_cupholder-8/weights/*
+!runs/detect/runs/aruco_cupholder-8/weights/best.pt
 
 # Dataset images/labels — images copied from ../captures/ via prepare_dataset.sh,
 # labels exported from Label Studio. Keep data.yaml (small, hand-edited class list).

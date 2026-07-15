@@ -321,6 +321,106 @@ since YOLO is meant to be a drop-in swap, not a parallel system:
   over `localhost` by a small `rclpy` node that does the `cv_bridge`
   conversion and re-publishes the result as the `PoseStamped` above
 
+## How this package talks to `visual_calibration` — API structure
+
+This directory has **zero ROS imports anywhere, by design** (the whole
+point of the venv isolation — see the ABI-conflict note at the top). It
+never touches `rclpy`/`cv_bridge` directly. Everything below describes the
+boundary a *different*, ROS-side node is responsible for crossing.
+
+### Today: direct Python function calls (what actually exists right now)
+
+No server, no network call — a caller running inside this same venv
+(e.g. a quick script, or `debug_server.py`) just imports and calls
+`aruco_pose.py`'s functions directly.
+
+**`detect_and_estimate(yolo_model_path, image_path, camera_matrix=None, dist_coeffs=None, conf=0.25, min_confirmations=None)`**
+— the ArUco marker pipeline (YOLO → crop → cascade → `cv::aruco`/`solvePnP`).
+
+```python
+from aruco_pose import detect_and_estimate
+
+result = detect_and_estimate(
+    "runs/detect/runs/aruco_cupholder-8/weights/best.pt",
+    "dataset/images/val/rgb_1783949386628.png",
+)
+if result is not None:
+    rvec, tvec = result
+```
+
+| field | type | meaning |
+|---|---|---|
+| `yolo_model_path` | `str` | path to a trained `best.pt` |
+| `image_path` | `str` | path to an image file on disk (not yet a raw `numpy` array — see Planned HTTP contract below) |
+| `camera_matrix` | `np.ndarray` (3x3) or `None` | intrinsics; `None` falls back to the hardcoded D415 reference snapshot (see the Training section's caveat — a real integration must pass this in live from `camera_info`, never rely on the default) |
+| `dist_coeffs` | `np.ndarray` (5,) or `None` | lens distortion; `None` falls back to the D415 default (all zeros — no distortion) |
+| `min_confirmations` | `int` or `None` | overrides `CASCADE_MIN_CONFIRMATIONS` for this call only |
+| **returns** | `(rvec, tvec)` tuple, or `None` | `rvec`: `np.ndarray` (3,), Rodrigues-format rotation vector. `tvec`: `np.ndarray` (3,), position in **meters**, in the camera's optical frame. `None` means no marker was found by any cascade variant — a real ROS-side caller should treat this as "no detection this frame," not an error. |
+
+**`detect_centroids(yolo_model_path_or_model, image, class_id, conf=0.25)`**
+— the `cup_holder`/`hole` pipeline (YOLO bbox-centroid only, no crop/classical-CV step — see the function's docstring for why that's sufficient for a straight-on circular object).
+
+```python
+from aruco_pose import detect_centroids, CUP_HOLDER_CLASS_ID, HOLE_CLASS_ID
+import cv2
+
+image = cv2.imread("dataset/images/val/rgb_1783949117515.png")
+holes = detect_centroids("runs/detect/runs/aruco_cupholder-8/weights/best.pt", image, HOLE_CLASS_ID)
+```
+
+| field | type | meaning |
+|---|---|---|
+| `yolo_model_path_or_model` | `str` path, or an already-loaded `ultralytics.YOLO` | accepts either, so a caller processing many images/classes can load the model once and reuse it |
+| `image` | `np.ndarray` (already-decoded BGR image, NOT a file path) | note this differs from `detect_and_estimate`'s `image_path` — an inconsistency worth normalizing before this becomes a real server endpoint |
+| `class_id` | `int` | `CUP_HOLDER_CLASS_ID` (1) or `HOLE_CLASS_ID` (2) |
+| **returns** | `list[dict]`, possibly empty | one dict per detected instance (0+, e.g. up to 4 for `hole`): `{"cx": float, "cy": float, "bbox": [x1,y1,x2,y2], "confidence": float}` — `cx`/`cy` are **2D pixel coordinates only**, not a 3D pose (no known real-world size to run `solvePnP` against, unlike the marker) |
+
+### Planned: HTTP server contract (not built yet)
+
+Per the locked architecture (`.claude/agents/yolopp.md`, `todo.txt` Thread
+D2): a persistent local HTTP server inside `~/yolo_venv` on the rosject,
+loading the model once at startup, exposing one inference endpoint. Image
+bytes in, detection JSON out — no ROS types cross this boundary in either
+direction. Shape not finalized, but the intended contract:
+
+**Request** — `POST /detect` (endpoint name illustrative, not locked)
+```json
+{
+  "image_jpeg_base64": "<base64-encoded JPEG bytes>",
+  "camera_matrix": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
+  "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0]
+}
+```
+`camera_matrix`/`dist_coeffs` are **required fields on every call**, sourced
+by the ROS-side caller from a live `camera_info` subscription — this server
+must never assume/cache intrinsics itself, for the same reason
+`detect_and_estimate`'s `camera_matrix=None` default is explicitly flagged
+as reference-only, not for real use.
+
+**Response** — one of two shapes depending on what was found:
+```json
+{
+  "aruco_marker": {"rvec": [rx, ry, rz], "tvec": [tx, ty, tz]},
+  "cup_holder": [{"cx": 123.4, "cy": 88.2, "confidence": 0.98}],
+  "hole": [{"cx": 110.1, "cy": 75.0, "confidence": 0.99}, ...]
+}
+```
+or, if nothing was detected for a given class, that key is either omitted
+or an empty list/`null` (exact convention TBD when this is built) — never a
+crash/500 for "no marker in this frame," since that's an expected, common
+case, not a server error.
+
+**The ROS-side integration point** (a small `rclpy` node, not yet written):
+receives a `sensor_msgs/Image`, converts via `cv_bridge`, base64-encodes the
+JPEG, reads the current `camera_info` message, POSTs both to this server
+over `localhost`, and republishes the response as
+`geometry_msgs/PoseStamped` on `/aruco_perception/marker_pose` (matching
+`aruco_detector_node`'s existing topic/message contract exactly — see
+`aruco_perception/config/aruco_detector_real.yaml`) for the `aruco_marker`
+case. What topic/message type the `cup_holder`/`hole` centroids should
+publish on (Task 3 territory) is not yet decided — flagged in `todo.txt`'s
+Thread C as not started.
+
 Nothing in this directory currently starts, calls, or depends on any of
 those — this is a forward-looking checklist for the integration step, not
 a description of what exists today.
