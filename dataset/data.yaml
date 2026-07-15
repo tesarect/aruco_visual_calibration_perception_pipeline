@@ -1,0 +1,19 @@
+# YOLO dataset config.
+# NOTE: `path` below is resolved by ultralytics relative to the CURRENT
+# WORKING DIRECTORY the training script is run from (YOLO-pipeline/), not
+# relative to this file's own location — hence "dataset" here, not ".".
+#
+# 3 classes: coarse localization only for all of them — precise geometry
+# (marker pose, hole center/radius, cup_holder center) comes from classical
+# CV (solvePnP / cv::aruco / HoughCircles) run on each cropped region
+# afterward, per the hybrid pattern. This model is NOT meant to regress
+# pose directly for any class.
+
+path: dataset
+train: images/train
+val: images/val
+
+names:
+  0: aruco_marker
+  1: cup_holder
+  2: hole
