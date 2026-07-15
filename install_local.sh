@@ -74,6 +74,9 @@ pip install --quiet torch --index-url https://download.pytorch.org/whl/cu121
 echo " ⬇️ Installing ultralytics (YOLO) + opencv-python-headless..."
 pip install --quiet ultralytics opencv-python-headless
 
+echo " ⬇️ Installing flask (debug_server.py + inference_server.py both need it)..."
+pip install --quiet flask
+
 echo " ⬇️ Installing Label Studio (labeling tool)..."
 echo "    Note: label-studio is significantly heavier than labelImg was — it"
 echo "    pulls in Django, Django REST Framework, and a local SQLite-backed"

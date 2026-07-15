@@ -148,15 +148,17 @@ def _cascade_functions():
     return [(name, by_name[name]) for name in CASCADE_PIPELINE]
 
 
-def detect_and_estimate(yolo_model_path, image_path, camera_matrix=None, dist_coeffs=None, conf=0.25,
-                         min_confirmations=None):
-    """Full pipeline: YOLO coarse localization -> crop -> cascade of
-    preprocessing variants (see CASCADE_PIPELINE) -> cv::aruco precise pose.
+def estimate_marker_pose_cascade(model, image, camera_matrix=None, dist_coeffs=None, conf=0.25,
+                                  min_confirmations=None, log_prefix=""):
+    """Same cascade logic as detect_and_estimate, but takes an
+    already-loaded YOLO model and an already-decoded image array — the form
+    the HTTP server needs (one model load at startup, one image per
+    request, no filesystem path involved). detect_and_estimate (below) is a
+    thin file-path convenience wrapper around this for offline script use.
 
     Tries each variant in CASCADE_PIPELINE order; stops as soon as
     `min_confirmations` consecutive-from-the-start variants have all
     successfully detected a marker (default: CASCADE_MIN_CONFIRMATIONS).
-    Returns the pose from the variant that satisfied the last confirmation.
 
     camera_matrix/dist_coeffs default to the D415's real captured intrinsics
     (see D415_CAMERA_MATRIX_424x240 above), auto-scaled to match the actual
@@ -164,10 +166,6 @@ def detect_and_estimate(yolo_model_path, image_path, camera_matrix=None, dist_co
     matrix read live from camera_info instead of relying on this default.
     """
     min_confirmations = min_confirmations if min_confirmations is not None else CASCADE_MIN_CONFIRMATIONS
-
-    image = cv2.imread(image_path)
-    if image is None:
-        raise FileNotFoundError(image_path)
 
     h, w = image.shape[:2]
     if camera_matrix is None:
@@ -178,10 +176,9 @@ def detect_and_estimate(yolo_model_path, image_path, camera_matrix=None, dist_co
         )
     dist_coeffs = dist_coeffs if dist_coeffs is not None else D415_DIST_COEFFS_424x240
 
-    model = YOLO(yolo_model_path)
     found = get_marker_crop(model, image, conf=conf)
     if found is None:
-        print(f"{image_path}: YOLO found no aruco_marker candidate")
+        print(f"{log_prefix}YOLO found no aruco_marker candidate")
         return None
 
     crop, _offset = found
@@ -200,7 +197,7 @@ def detect_and_estimate(yolo_model_path, image_path, camera_matrix=None, dist_co
         last_pose = pose
         if consecutive_successes >= min_confirmations:
             rvec, tvec, _corners = pose
-            print(f"{image_path}: pose found via '{name}' "
+            print(f"{log_prefix}pose found via '{name}' "
                   f"({consecutive_successes} consecutive confirmation(s)) — "
                   f"tvec (x,y,z in meters) = {tvec.ravel()}")
             return rvec, tvec
@@ -210,14 +207,28 @@ def detect_and_estimate(yolo_model_path, image_path, camera_matrix=None, dist_co
         # row, but at least one variant did detect something — surface it
         # rather than silently discarding a plausible pose.
         rvec, tvec, _corners = last_pose
-        print(f"{image_path}: cascade exhausted without {min_confirmations} consecutive "
+        print(f"{log_prefix}cascade exhausted without {min_confirmations} consecutive "
               f"confirmations; returning last successful pose anyway — "
               f"tvec (x,y,z in meters) = {tvec.ravel()}")
         return rvec, tvec
 
-    print(f"{image_path}: YOLO found a candidate box, but cv::aruco could not "
+    print(f"{log_prefix}YOLO found a candidate box, but cv::aruco could not "
           f"confirm/detect a marker in any cascade variant (false positive, or crop too tight)")
     return None
+
+
+def detect_and_estimate(yolo_model_path, image_path, camera_matrix=None, dist_coeffs=None, conf=0.25,
+                         min_confirmations=None):
+    """Thin file-path convenience wrapper around estimate_marker_pose_cascade,
+    for offline scripts/one-off calls (loads a fresh model per call — fine
+    here, but NOT what the HTTP server uses, see inference_server.py)."""
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(image_path)
+    model = YOLO(yolo_model_path)
+    return estimate_marker_pose_cascade(
+        model, image, camera_matrix, dist_coeffs, conf, min_confirmations, log_prefix=f"{image_path}: "
+    )
 
 
 def get_marker_crop(yolo_model, image, conf=0.25, margin_frac=0.2):

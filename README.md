@@ -38,6 +38,11 @@ YOLO-pipeline/
 │   └── weights/best.pt          # the trained model you actually want
 ├── debug_output/                # aruco_pose.py's debug-sweep images + results.json
 │   └── results.json
+├── findings/                    # benchmark_cascade.py's CSV + plot_cascade_benchmark.py's PNGs
+│   ├── cascade_benchmark.csv
+│   ├── time_to_first_success.png
+│   ├── total_time_per_image.png
+│   └── per_variant_breakdown.png
 ├── yolo11n.pt                   # pretrained nano checkpoint (base for transfer learning)
 ├── install_local.sh
 ├── uninstall_local.sh
@@ -48,6 +53,9 @@ YOLO-pipeline/
 ├── aruco_pose.py
 ├── preprocess_variants.py
 ├── debug_server.py
+├── inference_server.py
+├── benchmark_cascade.py
+├── plot_cascade_benchmark.py
 └── README.md
 ```
 
@@ -258,6 +266,61 @@ variants 1st/2nd/3rd... by actual measured time), and an overall chart
 variants plot lower). Debugging/inspection only — never runs on the
 production rosject server.
 
+## GPU vs CPU cascade benchmark (`findings/`)
+
+Why this exists: real-time video-rate detection was considered (e.g. for a
+live tracking loop during arm motion) and deliberately NOT built for the
+calibration use case — the cascade's worst case (a hard frame falling
+through to the slow upscale variants) is an uneven latency spike, and a
+continuously-moving arm risks the detection lagging behind the arm's actual
+current pose by the time a hard frame resolves. This is the same class of
+motion-blur/stale-sample bug already fixed once in
+`calibration_broadcaster_node` (`error-mitigation.md` #20) — the existing
+settle-then-sample design (wait for the arm to stop, then wait for a fresh
+detection) already avoids it, so a continuous video pipeline isn't needed
+for calibration itself. See `todo.txt`'s Thread D2 "FINDING for Thread A"
+note for the full reasoning. What IS useful from this investigation:
+concrete GPU-vs-CPU timing numbers for the cascade, e.g. for presenting
+what the preprocessing cost actually looks like on this project's two real
+target machines. This benchmark is presentation/analysis tooling only —
+production (`inference_server.py`) never runs it.
+
+```bash
+cd YOLO-pipeline
+source venv/bin/activate
+python3 -u benchmark_cascade.py --label "local RTX 2060 SUPER"
+```
+
+Sweeps all 60 real images (train + val) through every variant in
+`preprocess_variants.PIPELINES` (the full candidate list, broader than just
+the locked-in 6-variant `CASCADE_PIPELINE` — this is a "which variant is
+fastest, period" investigation, not a re-test of the production cascade
+order). For every image records: time for each variant tried, in order,
+cumulative time to the first successful detection, and total per-image
+time. Auto-detects GPU vs CPU (`--device cuda`/`--device cpu` to force
+either); results **append** (never overwrite) to
+`findings/cascade_benchmark.csv`, tagged by a `device` column plus your
+`--label`, so a GPU run done here and a CPU run done later on the rosject
+(same script, same command, run there) both live in the same file for
+direct comparison.
+
+```bash
+python3 -u plot_cascade_benchmark.py
+```
+
+Reads the CSV (however many device/label groups it currently has — 1 after
+just the GPU run, 2 once the rosject's CPU run is appended) and
+(re-)generates three bar-chart PNGs under `findings/`:
+`time_to_first_success.png` (average time to the first successful cascade
+variant per group — the presentation headline number), `total_time_per_image.png`
+(average total per-image time, all variants attempted, whether or not one
+succeeded), and `per_variant_breakdown.png` (average time per individual
+variant, grouped by device — shows where time actually goes inside the
+cascade, not just the aggregate). Safe to re-run any time after new
+benchmark data is appended; always regenerates all three from the
+CSV's full current contents, so running it again after the rosject's CPU
+data lands will produce the actual side-by-side comparison graphs.
+
 ## Cleaning up
 
 - `bash clean.sh` — clears `dataset/images`, `dataset/labels`, training run
@@ -375,52 +438,84 @@ holes = detect_centroids("runs/detect/runs/aruco_cupholder-8/weights/best.pt", i
 | `class_id` | `int` | `CUP_HOLDER_CLASS_ID` (1) or `HOLE_CLASS_ID` (2) |
 | **returns** | `list[dict]`, possibly empty | one dict per detected instance (0+, e.g. up to 4 for `hole`): `{"cx": float, "cy": float, "bbox": [x1,y1,x2,y2], "confidence": float}` — `cx`/`cy` are **2D pixel coordinates only**, not a 3D pose (no known real-world size to run `solvePnP` against, unlike the marker) |
 
-### Planned: HTTP server contract (not built yet)
+### The HTTP inference server (`inference_server.py`) — built and tested
 
 Per the locked architecture (`.claude/agents/yolopp.md`, `todo.txt` Thread
-D2): a persistent local HTTP server inside `~/yolo_venv` on the rosject,
-loading the model once at startup, exposing one inference endpoint. Image
-bytes in, detection JSON out — no ROS types cross this boundary in either
-direction. Shape not finalized, but the intended contract:
+D2): a persistent local HTTP server, loading the model **once** at startup
+(not per-request — the whole reason this is a server, not
+subprocess-per-call), exposing one inference endpoint. Image bytes in,
+detection JSON out — no ROS types cross this boundary in either direction,
+no `rclpy`/`cv_bridge` import anywhere in `inference_server.py`.
 
-**Request** — `POST /detect` (endpoint name illustrative, not locked)
+```bash
+cd YOLO-pipeline
+source venv/bin/activate
+python3 inference_server.py   # binds 127.0.0.1:8600, loads MODEL_PATH at startup
+```
+
+**`GET /health`** — cheap liveness check, does not force a model load.
+```json
+{"status": "ok", "model_loaded": true}
+```
+
+**`POST /detect`**
+
+Request:
 ```json
 {
   "image_jpeg_base64": "<base64-encoded JPEG bytes>",
   "camera_matrix": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
-  "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0]
+  "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+  "conf": 0.25
 }
 ```
-`camera_matrix`/`dist_coeffs` are **required fields on every call**, sourced
-by the ROS-side caller from a live `camera_info` subscription — this server
-must never assume/cache intrinsics itself, for the same reason
-`detect_and_estimate`'s `camera_matrix=None` default is explicitly flagged
-as reference-only, not for real use.
+| field | type | required | meaning |
+|---|---|---|---|
+| `image_jpeg_base64` | `str` | yes | a JPEG-encoded frame, base64-encoded |
+| `camera_matrix` | `[[3],[3],[3]]` | yes | intrinsics — **no server-side default or cache**, must come from a live `camera_info` subscription on the caller's side, every request |
+| `dist_coeffs` | `[5]` | yes | lens distortion coefficients |
+| `conf` | `float` | no (default `0.25`) | YOLO confidence threshold |
 
-**Response** — one of two shapes depending on what was found:
+A missing/malformed `image_jpeg_base64`, `camera_matrix`, or `dist_coeffs`
+returns HTTP 400 with `{"error": "<reason>"}` — confirmed via manual
+testing (bad base64, empty body). A model load failure at request time
+(e.g. a missing/corrupt weights file) returns HTTP 500. Neither case is a
+process crash.
+
+Response — confirmed via a real request against a val image:
 ```json
 {
-  "aruco_marker": {"rvec": [rx, ry, rz], "tvec": [tx, ty, tz]},
-  "cup_holder": [{"cx": 123.4, "cy": 88.2, "confidence": 0.98}],
-  "hole": [{"cx": 110.1, "cy": 75.0, "confidence": 0.99}, ...]
+  "aruco_marker": {
+    "rvec": [-3.1334, 0.2223, 0.0011],
+    "tvec": [-0.4081, -0.2183, 0.6506]
+  },
+  "hole": [
+    {"cx": 206.46, "cy": 148.44, "confidence": 0.96},
+    {"cx": 206.88, "cy": 190.64, "confidence": 0.89}
+  ]
 }
 ```
-or, if nothing was detected for a given class, that key is either omitted
-or an empty list/`null` (exact convention TBD when this is built) — never a
-crash/500 for "no marker in this frame," since that's an expected, common
-case, not a server error.
+**A key is entirely omitted (not `null`/empty-list) if that class wasn't
+found in the frame** — confirmed by testing an image with no marker: the
+response contained only `cup_holder`/`hole`, no `aruco_marker` key at all,
+and no error. This is expected/common, not a server error — a caller
+should check for key presence, not assume all three always appear.
+`aruco_marker.rvec`/`tvec` are the same Rodrigues-vector/meters convention
+as the direct Python API above; `cup_holder`/`hole` entries are the same
+shape `detect_centroids()` returns, minus `bbox` (kept out of the response
+intentionally — the ROS-facing contract only needs the centroid + a
+confidence to weigh it by, not the full box).
 
-**The ROS-side integration point** (a small `rclpy` node, not yet written):
-receives a `sensor_msgs/Image`, converts via `cv_bridge`, base64-encodes the
-JPEG, reads the current `camera_info` message, POSTs both to this server
-over `localhost`, and republishes the response as
+**Still not built — the actual ROS-side integration point** (a small
+`rclpy` node): receives a `sensor_msgs/Image`, converts via `cv_bridge`,
+base64-encodes the JPEG, reads the current `camera_info` message, POSTs
+both to this server over `localhost`, and republishes the response as
 `geometry_msgs/PoseStamped` on `/aruco_perception/marker_pose` (matching
 `aruco_detector_node`'s existing topic/message contract exactly — see
 `aruco_perception/config/aruco_detector_real.yaml`) for the `aruco_marker`
 case. What topic/message type the `cup_holder`/`hole` centroids should
 publish on (Task 3 territory) is not yet decided — flagged in `todo.txt`'s
-Thread C as not started.
-
-Nothing in this directory currently starts, calls, or depends on any of
-those — this is a forward-looking checklist for the integration step, not
-a description of what exists today.
+Thread C as not started. Also not yet done: deploying `inference_server.py`
++ `best.pt` to the rosject's `~/yolo_venv` and wiring a startup/stop script
+for it (matching `install_yolo.sh`'s convention) — this has only been run
+and tested on the local machine so far.
