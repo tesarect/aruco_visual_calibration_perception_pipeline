@@ -15,14 +15,25 @@
 #
 # Run inside YOLO-pipeline/venv only.
 
+import os
+from pathlib import Path
+
 import cv2
 import numpy as np
+import yaml
 from ultralytics import YOLO
 
 MARKER_LENGTH_M = 0.045  # 45mm ArUco marker, per project spec
 ARUCO_MARKER_CLASS_ID = 0  # matches dataset/data.yaml: 0=aruco_marker
 CUP_HOLDER_CLASS_ID = 1  # matches dataset/data.yaml: 1=cup_holder
 HOLE_CLASS_ID = 2  # matches dataset/data.yaml: 2=hole
+
+# Which environment's config/cascade_<env>.yaml to load — set via the
+# INFERENCE_ENV env var (inference_server.py's --env flag sets this before
+# importing this module) or defaults to "real". Never hardcode env-specific
+# values in code — see config/cascade_sim.yaml / cascade_real.yaml.
+INFERENCE_ENV = os.environ.get("INFERENCE_ENV", "real")
+CONFIG_DIR = Path(__file__).parent / "config"
 
 # Real D415 intrinsics, captured live via:
 #   ros2 topic echo /D415/color/camera_info --once --full-length
@@ -112,40 +123,87 @@ def estimate_marker_pose(crop, camera_matrix, dist_coeffs, marker_length_m=MARKE
 
 
 # ---------------------------------------------------------------------------
-# PRODUCTION CASCADE — an ordered, explicitly-named subset of
-# preprocess_variants.PIPELINES, picked from empirical debug-sweep results
-# (see debug_output/ + debug_server.py): fastest/most-reliable variants
-# first, more expensive ones only tried if earlier ones fail. Tune this list
-# and CASCADE_MIN_CONFIRMATIONS freely as more data comes in — nothing else
-# in this file needs to change when you do.
+# PRODUCTION CASCADE — loaded from config/cascade_<env>.yaml (an ordered
+# list of preprocess_variants.PIPELINES names + min_confirmations), NOT
+# hardcoded Python constants — so tuning the cascade order/stop-condition
+# never requires a code change, only a YAML edit. See config/cascade_real.yaml
+# (empirically tuned, see findings/) and config/cascade_sim.yaml (starting
+# point, not yet tuned).
 #
-# CASCADE_MIN_CONFIRMATIONS: how many variants in a row must agree a marker
-# was detected before the cascade accepts the pose and stops. 1 = accept the
+# min_confirmations: how many variants in a row must agree a marker was
+# detected before the cascade accepts the pose and stops. 1 = accept the
 # very first successful variant (fastest, but no cross-check). Higher values
 # add a cheap "does a second/third variant also agree" sanity check without
 # the cost of a real corner-quality analysis — trades a bit of latency for
 # confidence that it wasn't a one-off false positive.
-CASCADE_PIPELINE = [
-    "gamma_0.7",
-    "gamma_1.5",
-    "clahe",
-    "upscale_4x",
-    "upscale_4x+clahe",
-    "upscale_4x+sharpen",
-]
-CASCADE_MIN_CONFIRMATIONS = 1
+_cascade_config_cache = None
 
 
-def _cascade_functions():
-    """Resolve CASCADE_PIPELINE names to their functions from
-    preprocess_variants.PIPELINES, so the cascade always uses the exact same
-    preprocessing code as the debug sweep — no duplicated logic to drift."""
+def load_cascade_config(env=None):
+    """Loads config/cascade_<env>.yaml, caching the result (the file is
+    only ever read once per process — a long-running server doesn't need to
+    re-read it on every request). Pass env explicitly to override
+    INFERENCE_ENV (mainly for tests/offline scripts working across both
+    environments in one process)."""
+    global _cascade_config_cache
+    if _cascade_config_cache is not None and env is None:
+        return _cascade_config_cache
+
+    env = env or INFERENCE_ENV
+    config_path = CONFIG_DIR / f"cascade_{env}.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"No cascade config found at {config_path} (env='{env}'). "
+            f"Expected config/cascade_sim.yaml or config/cascade_real.yaml."
+        )
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    if "pipeline" not in config or "min_confirmations" not in config:
+        raise ValueError(f"{config_path} must define both 'pipeline' and 'min_confirmations'")
+
+    if env == INFERENCE_ENV:
+        _cascade_config_cache = config
+    return config
+
+
+def _cascade_functions(env=None):
+    """Resolve the loaded cascade config's variant names to their functions
+    from preprocess_variants.PIPELINES, so the cascade always uses the exact
+    same preprocessing code as the debug sweep — no duplicated logic to drift."""
     from preprocess_variants import PIPELINES
+    config = load_cascade_config(env)
     by_name = dict(PIPELINES)
-    missing = [name for name in CASCADE_PIPELINE if name not in by_name]
+    missing = [name for name in config["pipeline"] if name not in by_name]
     if missing:
-        raise ValueError(f"CASCADE_PIPELINE names not found in preprocess_variants.PIPELINES: {missing}")
-    return [(name, by_name[name]) for name in CASCADE_PIPELINE]
+        raise ValueError(
+            f"cascade_{env or INFERENCE_ENV}.yaml's pipeline names not found "
+            f"in preprocess_variants.PIPELINES: {missing}"
+        )
+    return [(name, by_name[name]) for name in config["pipeline"]]
+
+
+def corners_to_full_frame(corners, crop_shape, variant_shape, crop_offset):
+    """Un-transforms cv::aruco's detected corners (in the preprocessed
+    variant image's pixel space) back to the ORIGINAL full-frame image's
+    pixel space, for drawing an overlay on the actual camera frame.
+
+    Two transforms to reverse, in order: (1) any resize a preprocessing
+    variant applied (only upscale/its combos change dimensions — computed
+    here from actual pixel shapes, not inferred from the variant's name, so
+    this stays correct regardless of what preprocessing combination
+    produced the image); (2) the crop offset from crop_with_margin (the
+    variant image only ever covers a sub-region of the full frame).
+    """
+    crop_h, crop_w = crop_shape[:2]
+    variant_h, variant_w = variant_shape[:2]
+    sx, sy = crop_w / variant_w, crop_h / variant_h
+    x1, y1 = crop_offset
+
+    full_frame_corners = corners.copy()
+    full_frame_corners[:, 0] = corners[:, 0] * sx + x1
+    full_frame_corners[:, 1] = corners[:, 1] * sy + y1
+    return full_frame_corners
 
 
 def estimate_marker_pose_cascade(model, image, camera_matrix=None, dist_coeffs=None, conf=0.25,
@@ -156,16 +214,18 @@ def estimate_marker_pose_cascade(model, image, camera_matrix=None, dist_coeffs=N
     request, no filesystem path involved). detect_and_estimate (below) is a
     thin file-path convenience wrapper around this for offline script use.
 
-    Tries each variant in CASCADE_PIPELINE order; stops as soon as
-    `min_confirmations` consecutive-from-the-start variants have all
-    successfully detected a marker (default: CASCADE_MIN_CONFIRMATIONS).
+    Tries each variant in config/cascade_<env>.yaml's pipeline order; stops
+    as soon as `min_confirmations` consecutive-from-the-start variants have
+    all successfully detected a marker (default: that same YAML's
+    min_confirmations value).
 
     camera_matrix/dist_coeffs default to the D415's real captured intrinsics
     (see D415_CAMERA_MATRIX_424x240 above), auto-scaled to match the actual
     image size being processed. On the real ROS-facing server, pass in the
     matrix read live from camera_info instead of relying on this default.
     """
-    min_confirmations = min_confirmations if min_confirmations is not None else CASCADE_MIN_CONFIRMATIONS
+    if min_confirmations is None:
+        min_confirmations = load_cascade_config()["min_confirmations"]
 
     h, w = image.shape[:2]
     if camera_matrix is None:
@@ -181,10 +241,11 @@ def estimate_marker_pose_cascade(model, image, camera_matrix=None, dist_coeffs=N
         print(f"{log_prefix}YOLO found no aruco_marker candidate")
         return None
 
-    crop, _offset = found
+    crop, crop_offset = found
 
     consecutive_successes = 0
     last_pose = None
+    last_variant_img = None
     for name, pipeline_fn in _cascade_functions():
         variant_img = pipeline_fn(crop)
         pose = estimate_marker_pose(variant_img, camera_matrix, dist_coeffs)
@@ -195,22 +256,29 @@ def estimate_marker_pose_cascade(model, image, camera_matrix=None, dist_coeffs=N
 
         consecutive_successes += 1
         last_pose = pose
+        last_variant_img = variant_img
         if consecutive_successes >= min_confirmations:
-            rvec, tvec, _corners = pose
+            rvec, tvec, corners = pose
+            full_frame_corners = corners_to_full_frame(
+                corners, crop.shape, variant_img.shape, crop_offset
+            )
             print(f"{log_prefix}pose found via '{name}' "
                   f"({consecutive_successes} consecutive confirmation(s)) — "
                   f"tvec (x,y,z in meters) = {tvec.ravel()}")
-            return rvec, tvec
+            return rvec, tvec, full_frame_corners
 
     if last_pose is not None:
         # cascade ran out of variants before reaching min_confirmations in a
         # row, but at least one variant did detect something — surface it
         # rather than silently discarding a plausible pose.
-        rvec, tvec, _corners = last_pose
+        rvec, tvec, corners = last_pose
+        full_frame_corners = corners_to_full_frame(
+            corners, crop.shape, last_variant_img.shape, crop_offset
+        )
         print(f"{log_prefix}cascade exhausted without {min_confirmations} consecutive "
               f"confirmations; returning last successful pose anyway — "
               f"tvec (x,y,z in meters) = {tvec.ravel()}")
-        return rvec, tvec
+        return rvec, tvec, full_frame_corners
 
     print(f"{log_prefix}YOLO found a candidate box, but cv::aruco could not "
           f"confirm/detect a marker in any cascade variant (false positive, or crop too tight)")
@@ -421,10 +489,16 @@ def run_debug_sweep(yolo_model_path, image_dirs, out_dir="debug_output", conf=0.
 
 
 if __name__ == "__main__":
-    from pathlib import Path
-
-    model_path = "runs/detect/runs/aruco_cupholder-8/weights/best.pt"
-    all_dirs = [Path("dataset/images/train"), Path("dataset/images/val")]
+    # Offline debug-sweep entry point — env-aware via INFERENCE_ENV (same
+    # variable inference_server.py's --env flag sets), so
+    # INFERENCE_ENV=sim python3 aruco_pose.py sweeps the sim dataset/model
+    # without a second copy of this file. Defaults to "real".
+    _paths_by_env = {
+        "real": ("runs/detect/runs/aruco_cupholder-8/weights/best.pt", "dataset"),
+        "sim": ("runs/detect/runs/aruco_cupholder_sim/weights/best.pt", "dataset_sim"),
+    }
+    model_path, dataset_dir = _paths_by_env[INFERENCE_ENV]
+    all_dirs = [Path(dataset_dir) / "images" / "train", Path(dataset_dir) / "images" / "val"]
 
     if DEBUG_MODE:
         run_debug_sweep(model_path, all_dirs)

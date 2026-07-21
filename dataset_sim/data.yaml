@@ -1,0 +1,25 @@
+# YOLO dataset config — SIM captures (Gazebo wrist-mounted camera),
+# separate from dataset/ (real D415 captures). Sim and real images look
+# visually different enough (synthetic rendering vs. real lighting/optics)
+# that they're trained as two independent models rather than merged — see
+# YOLO-pipeline/README.md for how this connects to inference_server_sim.py
+# / inference_server_real.py.
+#
+# NOTE: `path` below is resolved by ultralytics relative to the CURRENT
+# WORKING DIRECTORY the training script is run from (YOLO-pipeline/), not
+# relative to this file's own location — hence "dataset_sim" here, not ".".
+#
+# 3 classes: coarse localization only for all of them — precise geometry
+# (marker pose, hole center/radius, cup_holder center) comes from classical
+# CV (solvePnP / cv::aruco / HoughCircles) run on each cropped region
+# afterward, per the hybrid pattern. This model is NOT meant to regress
+# pose directly for any class.
+
+path: dataset_sim
+train: images/train
+val: images/val
+
+names:
+  0: aruco_marker
+  1: cup_holder
+  2: hole

@@ -1,0 +1,23 @@
+# Production ArUco-detection preprocessing cascade — SIM environment.
+#
+# Loaded by aruco_pose.py at runtime (see load_cascade_config()) instead of
+# hardcoded Python constants, so tuning this never requires a code change.
+#
+# STARTING-POINT VALUES, not empirically tuned yet — unlike cascade_real.yaml
+# (tuned against findings/cascade_benchmark.csv's real D415 sweep), sim has
+# no equivalent sweep run yet. Sim's synthetic Gazebo rendering is generally
+# cleaner/more consistent than real captures (see the sim model's strong
+# ~0.99 mAP across all 3 classes with no weak class, unlike the real
+# model's initial run), so "original" (no preprocessing at all) is likely
+# sufficient most of the time — kept first in the list for that reason.
+# Re-run benchmark_cascade.py / the debug sweep (aruco_pose.py with
+# DEBUG_MODE=True, pointed at dataset_sim/) against a larger sim capture
+# set once available, then update this file the same way cascade_real.yaml
+# was derived.
+pipeline:
+  - original
+  - gamma_0.7
+  - gamma_1.5
+  - clahe
+
+min_confirmations: 1

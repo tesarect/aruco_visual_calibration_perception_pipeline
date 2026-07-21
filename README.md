@@ -487,11 +487,12 @@ Response — confirmed via a real request against a val image:
 {
   "aruco_marker": {
     "rvec": [-3.1334, 0.2223, 0.0011],
-    "tvec": [-0.4081, -0.2183, 0.6506]
+    "tvec": [-0.4081, -0.2183, 0.6506],
+    "corners": [[180.0, 110.0], [201.0, 107.0], [204.0, 128.0], [183.0, 131.0]]
   },
   "hole": [
-    {"cx": 206.46, "cy": 148.44, "confidence": 0.96},
-    {"cx": 206.88, "cy": 190.64, "confidence": 0.89}
+    {"cx": 206.46, "cy": 148.44, "confidence": 0.96, "bbox": [190.1, 130.2, 222.8, 166.7]},
+    {"cx": 206.88, "cy": 190.64, "confidence": 0.89, "bbox": [188.4, 172.9, 225.3, 208.1]}
   ]
 }
 ```
@@ -501,10 +502,22 @@ response contained only `cup_holder`/`hole`, no `aruco_marker` key at all,
 and no error. This is expected/common, not a server error — a caller
 should check for key presence, not assume all three always appear.
 `aruco_marker.rvec`/`tvec` are the same Rodrigues-vector/meters convention
-as the direct Python API above; `cup_holder`/`hole` entries are the same
-shape `detect_centroids()` returns, minus `bbox` (kept out of the response
-intentionally — the ROS-facing contract only needs the centroid + a
-confidence to weigh it by, not the full box).
+as the direct Python API above. `aruco_marker.corners` is the marker's 4
+detected corners, already converted back to FULL-FRAME pixel coordinates
+(`corners_to_full_frame()` undoes both the YOLO crop offset and any
+preprocessing-variant resize, e.g. the cascade's `upscale_4x` variant —
+verified correct via a direct unit test simulating the upscale case, not
+just the no-op case) — used by `yolo_marker_bridge_node` to draw the same
+yellow-border+axes overlay classical's `aruco_detector_node` does, on
+`/aruco_perception/overlay_image`, matching its `bgr8` encoding and visual
+convention exactly. `cup_holder`/`hole` entries are the exact same shape
+`detect_centroids()` returns (`cx`, `cy`, `confidence`, `bbox` as
+`[x1, y1, x2, y2]` pixels) — `bbox` is included (not stripped) so a
+consumer like depth-perception can sample a small patch within it for a
+depth lookup, more robust than a single noisy pixel read. On the ROS side,
+`yolo_marker_bridge_node` republishes this array as
+`visual_calibration_msgs/Detection2DArray` on
+`/aruco_perception/detections_2d` — see that node's own docstring.
 
 **Still not built — the actual ROS-side integration point** (a small
 `rclpy` node): receives a `sensor_msgs/Image`, converts via `cv_bridge`,

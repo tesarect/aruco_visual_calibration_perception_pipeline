@@ -1,0 +1,10 @@
+# inference_server.py config — SIM environment.
+# Mirrors this project's existing sim/real YAML-split convention (e.g.
+# aruco_perception/config/aruco_detector_sim.yaml vs _real.yaml) instead of
+# a separate script/port per environment.
+#
+# Select via: python3 inference_server.py --env sim  (or INFERENCE_ENV=sim)
+
+model_path: "runs/detect/runs/aruco_cupholder_sim/weights/best.pt"
+host: "127.0.0.1"
+port: 8600

@@ -1,0 +1,26 @@
+# Production ArUco-detection preprocessing cascade — REAL robot environment.
+#
+# Loaded by aruco_pose.py at runtime (see load_cascade_config()) instead of
+# hardcoded Python constants, so tuning this never requires a code change.
+#
+# pipeline: an ORDERED list of variant names, tried in sequence. Each name
+# must exist in preprocess_variants.PIPELINES (aruco_pose.py raises a clear
+# error at startup if not — no silent typo). Cheapest/most-reliable variants
+# first, expensive ones only tried if earlier ones fail — see
+# findings/cascade_benchmark.csv and findings/*.png for the empirical GPU
+# vs CPU timing data this order was picked from (real D415 captures).
+#
+# min_confirmations: how many variants in a row must agree a marker was
+# detected before the cascade accepts the pose and stops. 1 = accept the
+# very first successful variant (fastest, no cross-check). Higher values
+# add a cheap "does a second/third variant also agree" sanity check without
+# the cost of a real corner-quality analysis, at some latency cost.
+pipeline:
+  - gamma_0.7
+  - gamma_1.5
+  - clahe
+  - upscale_4x
+  - upscale_4x+clahe
+  - upscale_4x+sharpen
+
+min_confirmations: 1

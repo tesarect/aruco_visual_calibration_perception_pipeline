@@ -4,36 +4,76 @@
 # then serves detection requests over localhost. No rclpy/cv_bridge import
 # anywhere in this process, ever — see the ABI-isolation notes in README.md.
 #
-# This is the server documented in README.md's "Planned: HTTP server
-# contract" section — request/response shapes here must stay in sync with
-# that doc if either changes.
+# This is the server documented in README.md's "How this package talks to
+# visual_calibration" section — request/response shapes here must stay in
+# sync with that doc if either changes.
+#
+# Model/host/port come from config/server_<env>.yaml (sim vs real — same
+# split convention as aruco_perception's aruco_detector_sim.yaml/_real.yaml),
+# NOT hardcoded here, so switching environments never needs a code change.
+# --env also sets INFERENCE_ENV so aruco_pose.py's cascade config
+# (config/cascade_<env>.yaml) matches automatically — see aruco_pose.py.
 #
 # Run inside YOLO-pipeline/venv only:
 #   source venv/bin/activate
 #   pip install flask   # one-time, if not already installed
-#   python3 inference_server.py
+#   python3 inference_server.py --env sim    # or --env real (default)
 #
 # On the rosject this is the process ~/yolo_venv's startup script should
-# launch in the background (matching install_yolo.sh's convention) — not
-# built yet, see todo.txt Thread D2.
+# launch in the background (matching install_yolo.sh's convention) — see
+# start_inference_server.sh.
 
+import argparse
 import base64
+import os
+
+# --env must be parsed and INFERENCE_ENV set BEFORE importing aruco_pose,
+# since aruco_pose reads INFERENCE_ENV at import time to pick its cascade
+# config. Only relevant when this file is run directly (python3
+# inference_server.py) — if ever imported as a module instead, set
+# INFERENCE_ENV in the environment before importing this file.
+if __name__ == "__main__":
+    _early_parser = argparse.ArgumentParser(add_help=False)
+    _early_parser.add_argument("--env", choices=["sim", "real"], default=None)
+    _early_args, _ = _early_parser.parse_known_args()
+    if _early_args.env:
+        os.environ["INFERENCE_ENV"] = _early_args.env
 
 import cv2
 import numpy as np
+import yaml
 from flask import Flask, jsonify, request
 from ultralytics import YOLO
 
 from aruco_pose import (
+    CONFIG_DIR,
     CUP_HOLDER_CLASS_ID,
     HOLE_CLASS_ID,
+    INFERENCE_ENV,
     detect_centroids,
     estimate_marker_pose_cascade,
 )
 
-MODEL_PATH = "runs/detect/runs/aruco_cupholder-8/weights/best.pt"
-HOST = "127.0.0.1"
-PORT = 8600
+
+def load_server_config(env):
+    config_path = CONFIG_DIR / f"server_{env}.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"No server config found at {config_path} (env='{env}'). "
+            f"Expected config/server_sim.yaml or config/server_real.yaml."
+        )
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+    for required in ("model_path", "host", "port"):
+        if required not in config:
+            raise ValueError(f"{config_path} is missing required field '{required}'")
+    return config
+
+
+_server_config = load_server_config(INFERENCE_ENV)
+MODEL_PATH = _server_config["model_path"]
+HOST = _server_config["host"]
+PORT = _server_config["port"]
 
 app = Flask(__name__)
 
@@ -85,8 +125,16 @@ def _camera_matrix_from_request(data):
 @app.route("/health", methods=["GET"])
 def health():
     # cheap liveness/readiness check — does NOT load the model if it isn't
-    # loaded yet, so this stays fast even before the first /detect call
-    return jsonify({"status": "ok", "model_loaded": _model is not None})
+    # loaded yet, so this stays fast even before the first /detect call.
+    # Includes env/model_path so a poller (e.g. start_inference_server.sh,
+    # or a tmux pane's wait_for_inference_server.sh) can confirm not just
+    # "a server is up" but "the RIGHT env's server is up".
+    return jsonify({
+        "status": "ok",
+        "model_loaded": _model is not None,
+        "env": INFERENCE_ENV,
+        "model_path": MODEL_PATH,
+    })
 
 
 @app.route("/detect", methods=["POST"])
@@ -119,18 +167,26 @@ def detect():
         model, image, camera_matrix, dist_coeffs, conf=conf, log_prefix="[/detect] "
     )
     if pose is not None:
-        rvec, tvec = pose
+        rvec, tvec, corners = pose
         response["aruco_marker"] = {
             "rvec": rvec.ravel().tolist(),
             "tvec": tvec.ravel().tolist(),
+            # 4 corner points (full-frame pixel coords, NOT crop-relative)
+            # for drawing the yellow border + axes overlay on the ROS side
+            # — same visual convention as aruco_detector_node's classical
+            # overlay_image. [[x,y], [x,y], [x,y], [x,y]].
+            "corners": corners.tolist(),
         }
 
-    # cup_holder / hole: bbox-centroid only, 0+ instances each.
+    # cup_holder / hole: bbox-centroid + bbox, 0+ instances each. bbox is
+    # included (not just cx/cy) so depth-perception can sample a small
+    # patch within it for a more robust depth read than a single pixel —
+    # see visual_calibration_msgs/Detection2D.msg's rationale.
     for key, class_id in (("cup_holder", CUP_HOLDER_CLASS_ID), ("hole", HOLE_CLASS_ID)):
         centroids = detect_centroids(model, image, class_id, conf=conf)
         if centroids:
             response[key] = [
-                {"cx": c["cx"], "cy": c["cy"], "confidence": c["confidence"]}
+                {"cx": c["cx"], "cy": c["cy"], "confidence": c["confidence"], "bbox": c["bbox"]}
                 for c in centroids
             ]
 
@@ -138,6 +194,8 @@ def detect():
 
 
 if __name__ == "__main__":
+    print(f"Starting inference_server.py (env='{INFERENCE_ENV}', model='{MODEL_PATH}', "
+          f"host='{HOST}', port={PORT})")
     get_model()  # load at startup, not on first request — a cold first
                  # request would otherwise pay the load cost and look like
                  # a hang/timeout to the caller
